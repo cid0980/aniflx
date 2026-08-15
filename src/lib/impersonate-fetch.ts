@@ -1,10 +1,13 @@
 /**
  * Fetch via curl-impersonate for Cloudflare-protected domains.
  * Uses the actual curl-impersonate binary with Chrome 116 TLS fingerprint.
+ * 
+ * Handles read-only filesystems (Vercel/Netlify/serverless) by copying
+ * the binary to /tmp on first use and chmod-ing it there.
  */
 import { execFileSync } from 'child_process';
 import { join } from 'path';
-import { existsSync, chmodSync } from 'fs';
+import { existsSync, copyFileSync, chmodSync, mkdirSync } from 'fs';
 
 const CF_DOMAINS = ['anidb.app', 'hls.anidb.app'];
 
@@ -15,11 +18,51 @@ function needsImpersonate(url: string): boolean {
   } catch { return false; }
 }
 
+let cachedBinPath: string | null = null;
+
 function getBinaryPath(): string {
-  const binPath = join(process.cwd(), 'node_modules', 'node-curl-impersonate', 'bin', 'curl-impersonate-chrome-linux-x86');
-  if (!existsSync(binPath)) throw new Error(`curl-impersonate binary not found at ${binPath}`);
-  chmodSync(binPath, 0o755);
-  return binPath;
+  if (cachedBinPath && existsSync(cachedBinPath)) return cachedBinPath;
+
+  const binName = 'curl-impersonate-chrome-linux-x86';
+
+  // Possible source locations (varies by hosting platform)
+  const sourcePaths = [
+    join(process.cwd(), 'node_modules', 'node-curl-impersonate', 'bin', binName),
+    join('/var/task', 'node_modules', 'node-curl-impersonate', 'bin', binName),
+    join('/app', 'node_modules', 'node-curl-impersonate', 'bin', binName),
+  ];
+
+  const sourcePath = sourcePaths.find(p => existsSync(p));
+  if (!sourcePath) {
+    throw new Error(`curl-impersonate binary not found. Searched: ${sourcePaths.join(', ')}`);
+  }
+
+  // Try chmod in-place first (works on writable filesystems like local dev)
+  try {
+    chmodSync(sourcePath, 0o755);
+    cachedBinPath = sourcePath;
+    return sourcePath;
+  } catch {
+    // Read-only filesystem (Vercel, Netlify, etc.) — copy to /tmp
+  }
+
+  const tmpDir = '/tmp/curl-impersonate';
+  const tmpPath = join(tmpDir, binName);
+
+  if (existsSync(tmpPath)) {
+    cachedBinPath = tmpPath;
+    return tmpPath;
+  }
+
+  try {
+    mkdirSync(tmpDir, { recursive: true });
+    copyFileSync(sourcePath, tmpPath);
+    chmodSync(tmpPath, 0o755);
+    cachedBinPath = tmpPath;
+    return tmpPath;
+  } catch (e) {
+    throw new Error(`Failed to prepare curl-impersonate binary: ${e instanceof Error ? e.message : String(e)}. Source: ${sourcePath}, Target: ${tmpPath}`);
+  }
 }
 
 // Chrome 116 TLS flags from node-curl-impersonate presets
@@ -77,7 +120,6 @@ export async function impersonateFetchBinary(url: string): Promise<{ buffer: Buf
   }
 
   const binPath = getBinaryPath();
-  // execFileSync with encoding: 'buffer' returns raw Buffer — no string corruption
   const result = execFileSync(binPath, [
     '-s', '--max-time', '30',
     ...CHROME_FLAGS,

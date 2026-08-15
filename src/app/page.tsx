@@ -47,7 +47,7 @@ export default function HomePage() {
 
   // Browse
   type BrowseTab = 'trending' | 'recent' | 'popular' | 'top';
-  const [browseTab, setBrowseTab] = useState<BrowseTab>('trending');
+  const [browseTab, setBrowseTab] = useState<BrowseTab>('recent');
   const [browseResults, setBrowseResults] = useState<AnimeResult[]>([]);
   const [browsePage, setBrowsePage] = useState(1);
   const [browseLoading, setBrowseLoading] = useState(true);
@@ -100,7 +100,7 @@ export default function HomePage() {
   // Load on mount
   useEffect(() => {
     refreshHistory();
-    loadBrowse('trending', 1, false);
+    loadBrowse('recent', 1, false);
   }, [refreshHistory, loadBrowse]);
 
   // Switch browse tab
@@ -346,7 +346,7 @@ export default function HomePage() {
             {/* Browse anime */}
             <div>
               <div className="flex items-center gap-1.5 mb-3 overflow-x-auto pb-1 no-scrollbar">
-                {([['trending', '🔥 Trending'], ['recent', '✨ This Season'], ['popular', '💫 Popular'], ['top', '⭐ Top Rated']] as const).map(([key, label]) => (
+                {([['recent', '🆕 New Releases'], ['trending', '🔥 Airing Now'], ['popular', '💫 Popular'], ['top', '⭐ Top Rated']] as const).map(([key, label]) => (
                   <button key={key} onClick={() => switchBrowseTab(key)}
                     className={`px-3 py-1.5 rounded-lg text-xs font-medium whitespace-nowrap transition-colors ${browseTab === key ? 'bg-purple-600 text-white' : 'bg-white/5 text-white/40 hover:bg-white/10'}`}>
                     {label}

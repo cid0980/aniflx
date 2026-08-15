@@ -6,7 +6,7 @@
 import { impersonateFetch } from '@/lib/impersonate-fetch';
 
 const BASE = 'https://anidb.app';
-const ANILIST_URL = 'https://graphql.anilist.co';
+const KITSU_URL = 'https://kitsu.io/api/edge';
 
 // ── curl-impersonate wrapper ──
 async function anidbFetch(url: string): Promise<string> {
@@ -74,167 +74,239 @@ export interface StreamResult {
   provider: string;
 }
 
-// ── AniList for metadata ──
-async function anilistQuery(query: string, variables: Record<string, unknown>) {
-  const res = await fetch(ANILIST_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-    body: JSON.stringify({ query, variables }),
+// ── Kitsu for metadata/search/browse ──
+async function kitsuFetch(path: string, params?: Record<string, string | number | undefined>) {
+  const url = new URL(`${KITSU_URL}${path}`);
+  if (params) {
+    for (const [key, value] of Object.entries(params)) {
+      if (value !== undefined && value !== '') url.searchParams.set(key, String(value));
+    }
+  }
+  const res = await fetch(url.toString(), {
+    headers: { Accept: 'application/vnd.api+json' },
+    cache: 'no-store',
   });
   const text = await res.text();
-  if (!res.ok) throw new Error(`AniList HTTP ${res.status}: ${text.slice(0, 200)}`);
-  return JSON.parse(text);
+  if (!res.ok) throw new Error(`Kitsu HTTP ${res.status}: ${text.slice(0, 200)}`);
+  return JSON.parse(text) as {
+    data: Array<Record<string, unknown>> | Record<string, unknown>;
+    links?: { next?: string | null };
+  };
 }
 
-function mapMedia(media: Record<string, unknown>[]): AnimeSearchResult[] {
-  return media.map((m) => {
-    const t = m.title as Record<string, string>;
-    const c = m.coverImage as Record<string, string>;
-    return {
-      id: m.id as number,
-      title: t?.english || t?.romaji || 'Unknown',
-      titleJp: t?.native || null,
-      image: c?.extraLarge || c?.large || '',
-      banner: (m.bannerImage as string) || null,
-      format: (m.format as string) || null,
-      episodes: (m.episodes as number) || null,
-      status: (m.status as string) || null,
-      score: (m.averageScore as number) || null,
-      year: (m.seasonYear as number) || null,
-      genres: (m.genres as string[]) || [],
-      description: (m.description as string) || null,
-    };
-  });
+function mapKitsuAnime(item: Record<string, unknown>): AnimeSearchResult {
+  const attrs = (item.attributes || {}) as Record<string, unknown>;
+  const titles = (attrs.titles || {}) as Record<string, string>;
+  const poster = (attrs.posterImage || {}) as Record<string, string>;
+  const cover = (attrs.coverImage || {}) as Record<string, string>;
+  const startDate = (attrs.startDate as string | undefined) || '';
+  const year = startDate ? Number(startDate.slice(0, 4)) : null;
+  const avg = attrs.averageRating ? Math.round(Number(attrs.averageRating)) : null;
+  return {
+    id: Number(item.id),
+    title: (attrs.canonicalTitle as string) || titles.en || titles.en_jp || titles.ja_jp || 'Unknown',
+    titleJp: titles.ja_jp || titles.en_jp || null,
+    image: poster.large || poster.medium || poster.small || '',
+    banner: cover.original || cover.large || cover.small || null,
+    format: ((attrs.subtype as string) || '').toUpperCase() || null,
+    episodes: (attrs.episodeCount as number | null) || null,
+    status: ((attrs.status as string) || '').toUpperCase() || null,
+    score: avg,
+    year,
+    genres: [],
+    description: (attrs.synopsis as string) || (attrs.description as string) || null,
+  };
 }
 
-const MEDIA_FIELDS = `id title { romaji english native }
-  coverImage { large extraLarge } bannerImage
-  format episodes status averageScore seasonYear genres
-  description(asHtml: false)`;
+// ── anidb.app scraping fallbacks ──
+function mapAnidbToSearchResult(r: AnimeResult, image?: string): AnimeSearchResult {
+  return {
+    id: Number(r.id),
+    title: r.title,
+    titleJp: null,
+    image: image || '',
+    banner: null,
+    format: null,
+    episodes: null,
+    status: null,
+    score: null,
+    year: null,
+    genres: [],
+    description: null,
+  };
+}
 
-export type BrowseSort = 'trending' | 'popular' | 'recent' | 'top' | 'upcoming';
-
-export async function browseAnime(sort: BrowseSort = 'trending', page = 1): Promise<{ ok: boolean; results?: AnimeSearchResult[]; hasNextPage?: boolean; error?: ApiError }> {
+async function anidbBrowse(page: number): Promise<{ ok: boolean; results?: AnimeSearchResult[]; hasNextPage?: boolean; error?: ApiError }> {
   try {
-    const now = new Date();
-    const currentSeason = ['WINTER','SPRING','SUMMER','FALL'][Math.floor(now.getMonth() / 3)];
-    const currentYear = now.getFullYear();
-
-    let sortArg: string;
-    let extraFilters = '';
-    switch (sort) {
-      case 'trending': sortArg = 'TRENDING_DESC'; extraFilters = ', status: RELEASING'; break;
-      case 'popular': sortArg = 'POPULARITY_DESC'; break;
-      case 'recent': sortArg = 'START_DATE_DESC'; extraFilters = `, seasonYear: ${currentYear}`; break;
-      case 'top': sortArg = 'SCORE_DESC'; extraFilters = ', episodes_greater: 0'; break;
-      case 'upcoming': sortArg = 'POPULARITY_DESC'; extraFilters = `, season: ${currentSeason}, seasonYear: ${currentYear}, status: NOT_YET_RELEASED`; break;
-    }
-
-    const gql = `query ($page: Int, $perPage: Int) {
-      Page(page: $page, perPage: $perPage) {
-        pageInfo { hasNextPage }
-        media(type: ANIME, sort: ${sortArg}${extraFilters}) { ${MEDIA_FIELDS} }
-      }
-    }`;
-    const json = await anilistQuery(gql, { page, perPage: 20 });
-    const p = json.data?.Page;
-    return { ok: true, results: mapMedia(p?.media || []), hasNextPage: p?.pageInfo?.hasNextPage || false };
+    const html = await anidbFetch(`${BASE}/browse?page=${page}`);
+    const results = parseAnidbHtml(html);
+    return { ok: true, results: results.map(r => mapAnidbToSearchResult(r, extractImageFromSlug(html, r.slug))), hasNextPage: results.length >= 20 };
   } catch (e) {
-    return { ok: false, error: { type: 'ANILIST_ERROR', message: 'Browse failed', technical: `${e instanceof Error ? e.message : String(e)}` } };
+    return { ok: false, error: { type: 'ANIDB_ERROR', message: 'Browse failed', technical: `${e instanceof Error ? e.message : String(e)}` } };
   }
 }
 
-export async function searchAnime(query: string, page = 1): Promise<{ ok: boolean; results?: AnimeSearchResult[]; hasNextPage?: boolean; error?: ApiError }> {
+async function anidbSearch(query: string): Promise<{ ok: boolean; results?: AnimeSearchResult[]; hasNextPage?: boolean; error?: ApiError }> {
   try {
-    const gql = `query ($search: String, $page: Int, $perPage: Int) {
-      Page(page: $page, perPage: $perPage) {
-        pageInfo { hasNextPage }
-        media(search: $search, type: ANIME, sort: SEARCH_MATCH) { ${MEDIA_FIELDS} }
-      }
-    }`;
-    const json = await anilistQuery(gql, { search: query, page, perPage: 20 });
-    const p = json.data?.Page;
-    return { ok: true, results: mapMedia(p?.media || []), hasNextPage: p?.pageInfo?.hasNextPage || false };
+    const results = await searchAnidb(query);
+    return { ok: true, results: results.map(r => mapAnidbToSearchResult(r)), hasNextPage: false };
   } catch (e) {
-    return { ok: false, error: { type: 'ANILIST_ERROR', message: 'Search failed', technical: `${e instanceof Error ? e.message : String(e)}` } };
+    return { ok: false, error: { type: 'ANIDB_ERROR', message: 'Search failed', technical: `${e instanceof Error ? e.message : String(e)}` } };
   }
 }
 
-export async function getAnimeDetail(id: number): Promise<{ ok: boolean; anime?: AnimeDetail; error?: ApiError }> {
+async function anidbDetail(title: string): Promise<{ ok: boolean; anime?: AnimeDetail; error?: ApiError }> {
   try {
-    const gql = `query ($id: Int) {
-      Media(id: $id, type: ANIME) {
-        id title { romaji english native }
-        coverImage { large extraLarge } bannerImage
-        format episodes status averageScore seasonYear season duration source genres
-        description(asHtml: false)
-        studios(isMain: true) { nodes { name } }
-      }
-    }`;
-    const json = await anilistQuery(gql, { id });
-    const m = json.data?.Media;
-    if (!m) return { ok: false, error: { type: 'NOT_FOUND', message: 'Anime not found', technical: `No media for id=${id}` } };
-    const t = m.title; const c = m.coverImage;
-    
-    // Try to find this anime on anidb.app
-    const searchTitle = t?.romaji || t?.english || '';
-    let anidbId: string | undefined;
-    let anidbSlug: string | undefined;
-    let providerEpisodes: EpisodeInfo[] | undefined;
-    try {
-      const anidbResult = await searchAnidb(searchTitle);
-      if (anidbResult.length > 0) {
-        // Try to match by title similarity
-        const match = anidbResult.find(r => 
-          r.title.toLowerCase() === (t?.english || '').toLowerCase() ||
-          r.title.toLowerCase() === (t?.romaji || '').toLowerCase()
-        ) || anidbResult[0];
-        anidbId = match.id;
-        anidbSlug = match.slug;
-
-        const epsResult = await getEpisodes(match.id);
-        if (epsResult.ok && epsResult.episodes?.length) {
-          providerEpisodes = epsResult.episodes;
-        }
-      }
-    } catch { /* ignore anidb search/episodes failure */ }
-
+    const results = await searchAnidb(title);
+    if (!results.length) return { ok: false, error: { type: 'NOT_FOUND', message: 'Anime not found', technical: `No results on anidb for "${title}"` } };
+    const match = results[0];
+    const epsResult = await getEpisodes(match.id);
+    const eps = epsResult.ok ? epsResult.episodes : undefined;
     return {
       ok: true,
       anime: {
-        id: m.id, title: t?.english || t?.romaji || 'Unknown', titleJp: t?.native || null,
-        image: c?.extraLarge || c?.large || '', banner: m.bannerImage || null,
-        format: m.format || null, episodes: m.episodes || null, status: m.status || null,
-        score: m.averageScore || null, year: m.seasonYear || null, genres: m.genres || [],
-        description: m.description || null,
-        studios: m.studios?.nodes?.map((s: { name: string }) => s.name) || [],
-        season: m.season || null, duration: m.duration || null, source: m.source || null,
-        anidbId, anidbSlug, providerEpisodes,
+        id: Number(match.id),
+        title: match.title,
+        titleJp: null, image: '', banner: null, format: null,
+        episodes: eps?.length || null, status: null, score: null, year: null,
+        genres: [], description: null, studios: [], season: null, duration: null, source: null,
+        anidbId: match.id, anidbSlug: match.slug, providerEpisodes: eps,
       },
     };
   } catch (e) {
-    return { ok: false, error: { type: 'ANILIST_ERROR', message: 'Failed to get anime details', technical: `${e instanceof Error ? e.message : String(e)}` } };
+    return { ok: false, error: { type: 'ANIDB_ERROR', message: 'Detail failed', technical: `${e instanceof Error ? e.message : String(e)}` } };
   }
 }
 
-// ── anidb.app search (HTML scraping) ──
-async function searchAnidb(query: string): Promise<AnimeResult[]> {
-  const html = await anidbFetch(`${BASE}/browse?q=${encodeURIComponent(query)}`);
+function parseAnidbHtml(html: string): AnimeResult[] {
   const regex = /href="https:\/\/anidb\.app\/anime\/([^"]+)"[^>]*title="([^"]+)"/g;
   const results: AnimeResult[] = [];
   let m: RegExpExecArray | null;
   while ((m = regex.exec(html)) !== null) {
     const slug = m[1];
     const numId = slug.match(/-(\d+)$/)?.[1];
-    if (numId) {
+    if (numId && !results.some(r => r.id === numId)) {
       results.push({
-        id: numId,
-        slug,
+        id: numId, slug,
         title: m[2].replace(/&#039;/g, "'").replace(/&amp;/g, '&').replace(/&quot;/g, '"'),
       });
     }
   }
   return results;
+}
+
+function extractImageFromSlug(html: string, slug: string): string {
+  const idx = html.indexOf(`/anime/${slug}"`);
+  if (idx < 0) return '';
+  const region = html.slice(Math.max(0, idx - 500), idx + 200);
+  const imgMatch = region.match(/src="(https:\/\/cdn[^"]+)"/);
+  return imgMatch?.[1] || '';
+}
+
+export type BrowseSort = 'trending' | 'popular' | 'recent' | 'top' | 'upcoming';
+
+export async function browseAnime(sort: BrowseSort = 'trending', page = 1): Promise<{ ok: boolean; results?: AnimeSearchResult[]; hasNextPage?: boolean; error?: ApiError }> {
+  // Try Kitsu first, fall back to anidb
+  try {
+    const offset = (page - 1) * 20;
+    let path = '/anime';
+    let params: Record<string, string | number | undefined> = { 'page[limit]': 20, 'page[offset]': offset };
+    switch (sort) {
+      case 'trending':
+        // Trending should feel current, not random old catalog entries.
+        params = { ...params, sort: '-userCount', 'filter[status]': 'current' };
+        break;
+      case 'popular':
+        params = { ...params, sort: '-userCount' };
+        break;
+      case 'recent':
+        // Actual newer currently airing/recently started titles.
+        params = { ...params, sort: '-startDate', 'filter[status]': 'current' };
+        break;
+      case 'top':
+        params = { ...params, sort: 'ratingRank' };
+        break;
+      case 'upcoming':
+        params = { ...params, sort: 'startDate', 'filter[status]': 'upcoming' };
+        break;
+    }
+    const json = await kitsuFetch(path, params);
+    const data = Array.isArray(json.data) ? json.data : [];
+    if (data.length > 0) return { ok: true, results: data.map(mapKitsuAnime), hasNextPage: !!json.links?.next };
+  } catch { /* Kitsu down, fall through to anidb */ }
+
+  return anidbBrowse(page);
+}
+
+export async function searchAnime(query: string, page = 1): Promise<{ ok: boolean; results?: AnimeSearchResult[]; hasNextPage?: boolean; error?: ApiError }> {
+  // Try Kitsu first, fall back to anidb
+  try {
+    const offset = (page - 1) * 20;
+    const json = await kitsuFetch('/anime', { 'filter[text]': query, 'page[limit]': 20, 'page[offset]': offset, sort: '-userCount' });
+    const data = Array.isArray(json.data) ? json.data : [];
+    if (data.length > 0) return { ok: true, results: data.map(mapKitsuAnime), hasNextPage: !!json.links?.next };
+  } catch { /* Kitsu down, fall through to anidb */ }
+
+  return anidbSearch(query);
+}
+
+export async function getAnimeDetail(id: number): Promise<{ ok: boolean; anime?: AnimeDetail; error?: ApiError }> {
+  // Try Kitsu first
+  let base: AnimeSearchResult | null = null;
+  let kitsuAttrs: Record<string, unknown> = {};
+  try {
+    const json = await kitsuFetch(`/anime/${id}`);
+    const item = (!Array.isArray(json.data) ? json.data : null) as Record<string, unknown> | null;
+    if (item) {
+      base = mapKitsuAnime(item);
+      kitsuAttrs = (item.attributes || {}) as Record<string, unknown>;
+    }
+  } catch { /* Kitsu down */ }
+
+  // Get anidb provider data
+  const searchTitle = base?.titleJp || base?.title || String(id);
+  let anidbId: string | undefined;
+  let anidbSlug: string | undefined;
+  let providerEpisodes: EpisodeInfo[] | undefined;
+  try {
+    const anidbResult = await searchAnidb(searchTitle);
+    if (anidbResult.length > 0) {
+      const match = anidbResult.find((r) => base && r.title.toLowerCase() === base.title.toLowerCase()) || anidbResult[0];
+      anidbId = match.id;
+      anidbSlug = match.slug;
+      const epsResult = await getEpisodes(match.id);
+      if (epsResult.ok && epsResult.episodes?.length) providerEpisodes = epsResult.episodes;
+
+      // If Kitsu was down, build base from anidb
+      if (!base) {
+        base = mapAnidbToSearchResult(match);
+        base.episodes = providerEpisodes?.length || null;
+      }
+    }
+  } catch { /* anidb also failed */ }
+
+  if (!base) {
+    // Both Kitsu and anidb failed — try anidb detail as last resort
+    return anidbDetail(String(id));
+  }
+
+  return {
+    ok: true,
+    anime: {
+      ...base,
+      studios: [],
+      season: null,
+      duration: (kitsuAttrs.episodeLength as number | null) || null,
+      source: null,
+      anidbId, anidbSlug, providerEpisodes,
+    },
+  };
+}
+
+// ── anidb.app search (HTML scraping) ──
+async function searchAnidb(query: string): Promise<AnimeResult[]> {
+  const html = await anidbFetch(`${BASE}/browse?q=${encodeURIComponent(query)}`);
+  return parseAnidbHtml(html);
 }
 
 // ── anidb.app episodes ──

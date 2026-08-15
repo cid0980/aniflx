@@ -1,22 +1,17 @@
 /**
  * Anime API — uses anidb.app (same provider as ani-cli v5)
- * Bypasses Cloudflare via node-curl-impersonate (TLS fingerprint spoofing)
+ * Bypasses Cloudflare via curl-impersonate binary (TLS fingerprint spoofing)
  */
 
-import { CurlImpersonate } from 'node-curl-impersonate';
+import { impersonateFetch } from '@/lib/impersonate-fetch';
 
 const BASE = 'https://anidb.app';
 const ANILIST_URL = 'https://graphql.anilist.co';
 
 // ── curl-impersonate wrapper ──
 async function anidbFetch(url: string): Promise<string> {
-  const curl = new CurlImpersonate(url, {
-    method: 'GET',
-    impersonate: 'chrome-116',
-    headers: {},
-  });
-  const r = await curl.makeRequest();
-  return r.response;
+  const r = await impersonateFetch(url);
+  return r.body;
 }
 
 // ── Types ──

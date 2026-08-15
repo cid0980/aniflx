@@ -69,6 +69,7 @@ export default function HomePage() {
   const [selectedEp, setSelectedEp] = useState(1);
   const [streamData, setStreamData] = useState<StreamData | null>(null);
   const [streamLoading, setStreamLoading] = useState(false);
+  const [streamTransitioning, setStreamTransitioning] = useState(false);
   const [streamError, setStreamError] = useState<ApiError | null>(null);
   const [resumeTime, setResumeTime] = useState(0);
 
@@ -136,20 +137,35 @@ export default function HomePage() {
   }, []);
 
   // Play episode
-  const playEpisode = useCallback(async (ep: number) => {
+  const playEpisode = useCallback(async (ep: number, options?: { seamless?: boolean }) => {
     if (!selectedAnime) return;
-    setSelectedEp(ep); setView('player'); setStreamLoading(true); setStreamError(null); setStreamData(null);
+    const seamless = !!options?.seamless;
+
+    if (!seamless) {
+      setSelectedEp(ep);
+    }
+    setView('player');
+    setStreamError(null);
+    setStreamLoading(!seamless);
+    setStreamTransitioning(seamless);
+    if (!seamless) {
+      setStreamData(null);
+    }
 
     // Check if we have a saved timestamp for this ep
     const hist = getHistory().find(h => h.animeId === selectedAnime.id);
-    setResumeTime(hist && hist.episodeNum === ep ? hist.timestamp : 0);
+    const nextResumeTime = hist && hist.episodeNum === ep ? hist.timestamp : 0;
+    setResumeTime(nextResumeTime);
 
     const params = new URLSearchParams();
     params.set('title', selectedAnime.title);
     if (selectedAnime.anidbId) params.set('anidbId', selectedAnime.anidbId);
     const r = await safeFetch<{ stream: StreamData }>(`/api/stream/${selectedAnime.id}/${ep}?${params.toString()}`);
-    if (!r.ok) setStreamError(r.error!);
-    else {
+    if (!r.ok) {
+      setStreamError(r.error!);
+    } else {
+      setSelectedEp(ep);
+      setResumeTime(nextResumeTime);
       setStreamData(r.data!.stream);
       // Save to history
       upsertWatch({
@@ -160,18 +176,30 @@ export default function HomePage() {
       refreshHistory();
     }
     setStreamLoading(false);
+    setStreamTransitioning(false);
   }, [selectedAnime, refreshHistory]);
 
-  // Auto-next episode
-  const handleEpisodeEnded = useCallback(() => {
-    if (!selectedAnime) return;
+  // Next episode helpers
+  const getNextEpisode = useCallback((): number | undefined => {
+    if (!selectedAnime) return undefined;
     const episodeNumbers = getEpisodeNumbers(selectedAnime);
     const currentIndex = episodeNumbers.indexOf(selectedEp);
-    const nextEp = currentIndex >= 0 ? episodeNumbers[currentIndex + 1] : undefined;
-    if (nextEp) {
-      playEpisode(nextEp);
+    return currentIndex >= 0 ? episodeNumbers[currentIndex + 1] : undefined;
+  }, [selectedAnime, selectedEp]);
+
+  // Auto-next / manual next episode — seamless, stays in player view
+  const handleNextEpisode = useCallback(() => {
+    const nextEp = getNextEpisode();
+    if (nextEp) playEpisode(nextEp, { seamless: true });
+  }, [getNextEpisode, playEpisode]);
+
+  // Fallback for when episode truly ends and there's no next
+  const handleEpisodeEnded = useCallback(() => {
+    const nextEp = getNextEpisode();
+    if (!nextEp) {
+      // No more episodes — do nothing, let user navigate
     }
-  }, [selectedAnime, selectedEp, playEpisode]);
+  }, [getNextEpisode]);
 
   // Save timestamp
   const handleTimeUpdate = useCallback((time: number) => {
@@ -445,21 +473,28 @@ export default function HomePage() {
               <h2 className="text-sm sm:text-base font-bold text-white">{selectedAnime.title}</h2>
               <p className="text-pink-400 text-xs font-medium">Episode {selectedEp}{getEpisodeNumbers(selectedAnime).length ? ` • ${getEpisodeNumbers(selectedAnime).length} available` : ''}</p>
             </div>
-            {streamLoading && (
+            {streamLoading && !streamData && (
               <div className="aspect-video bg-[#1a1a2e] rounded-xl flex items-center justify-center">
                 <div className="flex flex-col items-center gap-2"><Spinner /><span className="text-white/30 text-xs">{randomPick(LOADING_MSGS)}</span></div>
               </div>
             )}
             {streamError && <TechnicalError error={streamError} onRetry={() => playEpisode(selectedEp)} />}
-            {streamData && (
-              <VideoPlayer
-                streamData={{ url: streamData.sources[0]?.url || '', isHLS: streamData.sources[0]?.isM3U8 || false, sourceName: streamData.provider, all: streamData.sources.map(s => ({ res: s.quality, url: s.url })) }}
-                onError={err => setStreamError(err)}
-                onTimeUpdate={handleTimeUpdate}
-                onEnded={handleEpisodeEnded}
-                initialTime={resumeTime}
-              />
-            )}
+            {streamData && (() => {
+              const nextEp = getNextEpisode();
+              return (
+                <VideoPlayer
+                  streamData={{ url: streamData.sources[0]?.url || '', isHLS: streamData.sources[0]?.isM3U8 || false, sourceName: streamData.provider, all: streamData.sources.map(s => ({ res: s.quality, url: s.url })) }}
+                  onError={err => setStreamError(err)}
+                  onTimeUpdate={handleTimeUpdate}
+                  onEnded={handleEpisodeEnded}
+                  onNextEpisode={handleNextEpisode}
+                  hasNextEpisode={!!nextEp}
+                  nextEpisodeNum={nextEp}
+                  initialTime={resumeTime}
+                  transitioning={streamTransitioning}
+                />
+              );
+            })()}
             {/* Episode nav */}
             {getEpisodeNumbers(selectedAnime).length > 1 && (
               <div className="pt-3 border-t border-white/5">

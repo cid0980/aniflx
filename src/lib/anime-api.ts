@@ -72,6 +72,8 @@ export interface StreamResult {
   subtitles: Array<{ lang: string; url: string }>;
   headers?: Record<string, string>;
   provider: string;
+  currentLang?: string;
+  availableLangs?: Array<{ code: string; name: string }>;
 }
 
 // ── Kitsu for metadata/search/browse ──
@@ -104,8 +106,8 @@ function mapKitsuAnime(item: Record<string, unknown>): AnimeSearchResult {
   const avg = attrs.averageRating ? Math.round(Number(attrs.averageRating)) : null;
   return {
     id: Number(item.id),
-    title: (attrs.canonicalTitle as string) || titles.en || titles.en_jp || titles.ja_jp || 'Unknown',
-    titleJp: titles.ja_jp || titles.en_jp || null,
+    title: titles.en || titles.en_us || (attrs.canonicalTitle as string) || titles.en_jp || 'Unknown',
+    titleJp: titles.ja_jp || null,
     image: poster.large || poster.medium || poster.small || '',
     banner: cover.original || cover.large || cover.small || null,
     format: ((attrs.subtype as string) || '').toUpperCase() || null,
@@ -213,21 +215,19 @@ export async function browseAnime(sort: BrowseSort = 'trending', page = 1): Prom
     let params: Record<string, string | number | undefined> = { 'page[limit]': 20, 'page[offset]': offset };
     switch (sort) {
       case 'trending':
-        // Trending should feel current, not random old catalog entries.
-        params = { ...params, sort: '-userCount', 'filter[status]': 'current' };
+        params = { ...params, sort: '-userCount', 'filter[status]': 'current', 'filter[subtype]': 'TV' };
         break;
       case 'popular':
-        params = { ...params, sort: '-userCount' };
+        params = { ...params, sort: '-userCount', 'filter[subtype]': 'TV' };
         break;
       case 'recent':
-        // Actual newer currently airing/recently started titles.
-        params = { ...params, sort: '-startDate', 'filter[status]': 'current' };
+        params = { ...params, sort: '-startDate', 'filter[status]': 'current', 'filter[subtype]': 'TV' };
         break;
       case 'top':
-        params = { ...params, sort: 'ratingRank' };
+        params = { ...params, sort: 'ratingRank', 'filter[subtype]': 'TV' };
         break;
       case 'upcoming':
-        params = { ...params, sort: 'startDate', 'filter[status]': 'upcoming' };
+        params = { ...params, sort: 'startDate', 'filter[status]': 'upcoming', 'filter[subtype]': 'TV' };
         break;
     }
     const json = await kitsuFetch(path, params);
@@ -337,8 +337,11 @@ export async function getStream(anidbEpId: number, lang = 'jpn'): Promise<{ ok: 
       return { ok: false, error: { type: 'NO_SOURCES', message: 'No language sources found', technical: `anidb returned empty languages for episode ${anidbEpId}` } };
     }
 
-    // Prefer requested language, fallback to first
-    const chosen = languages.find(l => l.code === lang) || languages[0];
+    // Pick language: prefer the requested lang, then fallback to first available
+    const chosen = languages.find(l => l.code === lang) || languages.find(l => l.code === 'eng') || languages[0];
+
+    // Also return available languages so frontend can show sub/dub toggle
+    const availableLangs = languages.map(l => ({ code: l.code, name: l.name }));
 
     // 2. Get embed page → extract m3u8
     const embedHtml = await anidbFetch(chosen.embed_url);
@@ -355,6 +358,8 @@ export async function getStream(anidbEpId: number, lang = 'jpn'): Promise<{ ok: 
         sources: [{ url: masterUrl, quality: 'auto', isM3U8: true }],
         subtitles: [],
         provider: `anidb/${chosen.name}`,
+        currentLang: chosen.code,
+        availableLangs,
       },
     };
   } catch (e) {
@@ -367,7 +372,8 @@ export async function findStreamForAnime(
   anilistId: number,
   episodeNum: number,
   title: string,
-  anidbIdHint?: string
+  anidbIdHint?: string,
+  lang?: string
 ): Promise<{ ok: boolean; stream?: StreamResult; error?: ApiError }> {
   try {
     // Step 1: Find anidb ID
@@ -395,7 +401,7 @@ export async function findStreamForAnime(
     }
 
     // Step 3: Get stream
-    return await getStream(targetEp.id);
+    return await getStream(targetEp.id, lang || 'jpn');
   } catch (e) {
     return { ok: false, error: { type: 'ANIDB_ERROR', message: 'Stream lookup failed', technical: `${e instanceof Error ? e.message : String(e)}` } };
   }

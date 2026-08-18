@@ -51,14 +51,24 @@ export default function VideoPlayer({
   const [duration, setDuration] = useState(0);
   const [isSeeking, setIsSeeking] = useState(false);
   const [longPressScrub, setLongPressScrub] = useState<{ active: boolean; time: number } | null>(null);
+  const [showSkipIntro, setShowSkipIntro] = useState(false);
   const lastTapRef = useRef<{ time: number; x: number }>({ time: 0, x: 0 });
   const seekedToInitial = useRef(false);
   const controlsTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const nextEpTriggered = useRef(false);
   const longPressTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const longPressStart = useRef<{ x: number; time: number } | null>(null);
+  const skipIntroTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  useEffect(() => { nextEpTriggered.current = false; setShowNextEpPrompt(false); }, [streamData]);
+  useEffect(() => {
+    nextEpTriggered.current = false;
+    setShowNextEpPrompt(false);
+    // Show "Skip Intro" for 5 seconds when a new episode starts
+    setShowSkipIntro(true);
+    if (skipIntroTimer.current) clearTimeout(skipIntroTimer.current);
+    skipIntroTimer.current = setTimeout(() => setShowSkipIntro(false), 5000);
+    return () => { if (skipIntroTimer.current) clearTimeout(skipIntroTimer.current); };
+  }, [streamData]);
 
   // Track fullscreen + auto-rotate to landscape
   useEffect(() => {
@@ -237,9 +247,10 @@ export default function VideoPlayer({
       lastTapRef.current = { time: 0, x: 0 };
     } else {
       lastTapRef.current = { time: now, x: touch.clientX };
+      togglePlay();
       flashControls();
     }
-  }, [handleDoubleTap, flashControls, longPressScrub]);
+  }, [handleDoubleTap, flashControls, longPressScrub, togglePlay]);
 
   const handleDoubleClick = useCallback((e: React.MouseEvent) => {
     const target = e.target as HTMLElement;
@@ -251,13 +262,30 @@ export default function VideoPlayer({
   const handleContainerClick = useCallback((e: React.MouseEvent) => {
     const target = e.target as HTMLElement;
     if (target.closest('button') || target.closest('[data-ctrl]')) return;
+    // Single click/tap toggles play/pause and shows controls
+    togglePlay();
     flashControls();
-  }, [flashControls]);
+  }, [flashControls, togglePlay]);
 
   const changeSpeed = useCallback((s: number) => {
     setSpeed(s);
     if (videoRef.current) videoRef.current.playbackRate = s;
     setShowSpeedMenu(false);
+    flashControls();
+  }, [flashControls]);
+
+  // Skip 90 seconds (intro/outro)
+  const skip90 = useCallback(() => {
+    const v = videoRef.current;
+    if (v) v.currentTime = Math.min(v.duration || Infinity, v.currentTime + 90);
+    flashControls();
+  }, [flashControls]);
+
+  // Skip intro (jump to 1:30 from start)
+  const skipIntro = useCallback(() => {
+    const v = videoRef.current;
+    if (v) v.currentTime = 90;
+    setShowSkipIntro(false);
     flashControls();
   }, [flashControls]);
 
@@ -285,6 +313,7 @@ export default function VideoPlayer({
     setLoading(true); setHlsError(null); seekedToInitial.current = false;
     if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null; }
     const url = streamData.url;
+    const isBlob = url.startsWith('blob:');
     const isHLS = streamData.isHLS || url.includes('.m3u8');
     const onReady = () => {
       setLoading(false);
@@ -292,7 +321,25 @@ export default function VideoPlayer({
       if (!seekedToInitial.current && initialTime && initialTime > 5) { video.currentTime = initialTime; seekedToInitial.current = true; }
       video.play().catch(() => {});
     };
-    if (isHLS) {
+    if (isBlob && isHLS) {
+      // Offline blob m3u8 — feed directly to HLS.js (no proxy)
+      if (Hls.isSupported()) {
+        const hls = new Hls({ fragLoadingMaxRetry: 2, manifestLoadingMaxRetry: 2, enableWorker: false });
+        hls.on(Hls.Events.ERROR, (_, d) => { if (d.fatal) { setHlsError(`Offline HLS: ${d.details}`); onError({ type: 'PROVIDER_ERROR', message: 'Offline playback failed', technical: `${d.type}/${d.details}` }); hls.destroy(); } });
+        hls.on(Hls.Events.MANIFEST_PARSED, onReady);
+        hls.loadSource(url);
+        hls.attachMedia(video);
+        hlsRef.current = hls;
+      } else {
+        video.src = url;
+        video.addEventListener('loadedmetadata', onReady, { once: true });
+      }
+    } else if (isBlob) {
+      // Non-HLS blob — try direct
+      video.src = url;
+      video.addEventListener('loadedmetadata', onReady, { once: true });
+      video.addEventListener('error', () => { setHlsError(`Offline playback error: ${video.error?.message}`); onError({ type: 'PROVIDER_ERROR', message: 'Offline playback failed', technical: `${video.error?.code}` }); }, { once: true });
+    } else if (isHLS) {
       const p = `/api/hlsproxy?url=${encodeURIComponent(url)}`;
       if (Hls.isSupported()) {
         const hls = new Hls({ fragLoadingMaxRetry: 5, manifestLoadingMaxRetry: 5, levelLoadingMaxRetry: 5, fragLoadingTimeOut: 30000, manifestLoadingTimeOut: 20000, levelLoadingTimeOut: 20000 });
@@ -379,32 +426,32 @@ export default function VideoPlayer({
         {skipIndicator && (
           <div className={`absolute top-1/2 -translate-y-1/2 z-30 pointer-events-none fade-in ${skipIndicator.side === 'left' ? 'left-4 sm:left-10' : 'right-4 sm:right-10'}`}>
             <div className="bg-black/70 rounded-full px-4 py-2 text-white text-sm font-medium backdrop-blur-sm">
-              {skipIndicator.side === 'left' ? '⏪ 10s' : '⏩ 10s'}
+              {skipIndicator.side === 'left' ? '−10s' : '+10s'}
             </div>
           </div>
         )}
 
-        {/* Center play button when paused */}
+        {/* Center pause/play indicator */}
         {showControls && !loading && isPaused && (
-          <button className="absolute inset-0 z-10 flex items-center justify-center" onClick={(e) => { e.stopPropagation(); togglePlay(); flashControls(); }}>
-            <div className="w-16 h-16 rounded-full bg-black/50 backdrop-blur flex items-center justify-center">
-              <svg viewBox="0 0 24 24" fill="white" className="w-8 h-8 ml-1"><polygon points="5,3 19,12 5,21" /></svg>
+          <div className="absolute inset-0 z-10 flex items-center justify-center pointer-events-none fade-in">
+            <div className="w-14 h-14 rounded-full bg-black/40 backdrop-blur-md flex items-center justify-center border border-white/10">
+              <svg viewBox="0 0 24 24" fill="white" className="w-7 h-7 ml-0.5 opacity-90"><polygon points="5,3 19,12 5,21" /></svg>
             </div>
-          </button>
+          </div>
         )}
 
         {/* Top bar: speed control */}
         <div className={`absolute top-0 left-0 right-0 z-30 p-2 sm:p-3 flex justify-end transition-opacity duration-300 pointer-events-none ${showControls ? 'opacity-100' : 'opacity-0'}`}>
-          <div className="relative pointer-events-auto">
+          <div className="relative pointer-events-auto touch-auto">
             <button onClick={(e) => { e.stopPropagation(); setShowSpeedMenu(!showSpeedMenu); flashControls(); }}
-              className="px-2.5 py-1.5 rounded-lg text-xs font-bold bg-black/60 text-white hover:bg-black/80 backdrop-blur-sm border border-white/10">
+              className="px-3 py-2 rounded-lg text-xs font-bold bg-black/60 text-white hover:bg-black/80 backdrop-blur-sm border border-white/10 min-w-[44px] text-center">
               {speed}x
             </button>
             {showSpeedMenu && (
-              <div className="absolute top-full right-0 mt-1 bg-black/90 border border-white/15 rounded-lg overflow-hidden shadow-2xl backdrop-blur-md" onClick={e => e.stopPropagation()}>
+              <div className="absolute top-full right-0 mt-1 max-h-56 overflow-y-auto overscroll-contain rounded-lg border border-white/15 bg-black/90 shadow-2xl backdrop-blur-md pointer-events-auto touch-auto" onClick={e => e.stopPropagation()}>
                 {SPEEDS.map(s => (
                   <button key={s} onClick={() => changeSpeed(s)}
-                    className={`block w-full px-5 py-2.5 text-sm text-left whitespace-nowrap ${s === speed ? 'bg-purple-600 text-white font-bold' : 'text-white/70 hover:bg-white/10'}`}>
+                    className={`block w-full px-5 py-3 text-sm text-left whitespace-nowrap ${s === speed ? 'bg-purple-600 text-white font-bold' : 'text-white/70 hover:bg-white/10 active:bg-white/20'}`}>
                     {s}x{s === 1 ? ' normal' : ''}
                   </button>
                 ))}
@@ -412,6 +459,16 @@ export default function VideoPlayer({
             )}
           </div>
         </div>
+
+        {/* Skip Intro button — appears for 5 seconds at start */}
+        {showSkipIntro && !loading && (
+          <div className="absolute top-14 right-3 sm:right-4 z-30 fade-in pointer-events-auto">
+            <button onClick={(e) => { e.stopPropagation(); skipIntro(); }}
+              className="px-4 py-2 rounded-xl bg-white/15 hover:bg-white/25 text-white text-sm font-medium backdrop-blur-sm border border-white/20 transition-colors">
+              Skip Intro →
+            </button>
+          </div>
+        )}
 
         {/* Near-end next episode popup */}
         {showNextEpPrompt && hasNextEpisode && (
@@ -447,6 +504,12 @@ export default function VideoPlayer({
                 ? <svg viewBox="0 0 24 24" fill="currentColor" className="w-6 h-6"><polygon points="5,3 19,12 5,21" /></svg>
                 : <svg viewBox="0 0 24 24" fill="currentColor" className="w-6 h-6"><rect x="5" y="3" width="4" height="18" /><rect x="15" y="3" width="4" height="18" /></svg>
               }
+            </button>
+
+            {/* Skip 90s button (skip intro/outro) */}
+            <button onClick={(e) => { e.stopPropagation(); skip90(); }}
+              className="text-white/50 hover:text-white p-1" title="Skip 1:30">
+              <span className="text-[10px] font-bold">+90s</span>
             </button>
 
             {/* Next episode button — always visible if there's a next ep */}

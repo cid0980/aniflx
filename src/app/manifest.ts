@@ -16,8 +16,8 @@ import type { MetadataRoute } from 'next';
  */
 export default function manifest(): MetadataRoute.Manifest {
   return {
-    name: "Cid's Anime",
-    short_name: 'CidAnime',
+    name: "AniFlix",
+    short_name: 'AniFlix',
     description: 'Personal anime streaming app for Cid.',
     start_url: '/',
     display: 'standalone',

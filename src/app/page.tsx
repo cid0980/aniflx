@@ -16,7 +16,7 @@ interface AnimeResult {
 }
 interface AnimeDetail extends AnimeResult {
   studios: string[]; season: string | null; duration: number | null; source: string | null;
-  anidbId?: string; anidbSlug?: string;
+  anidbId?: string; anidbSlug?: string; providerAliases?: string[];
   providerEpisodes?: Array<{ id: number; number: number; filler: boolean }>;
 }
 interface StreamSource { url: string; quality: string; isM3U8: boolean; }
@@ -130,7 +130,9 @@ export default function HomePage() {
   const openAnime = useCallback(async (anime: AnimeResult) => {
     setView('detail'); setDetailLoading(true); setDetailError(null); setSelectedAnime(null);
     setStreamData(null); setStreamError(null);
-    const r = await safeFetch<{ anime: AnimeDetail }>(`/api/anime/${anime.id}`);
+    const detailParams = new URLSearchParams({ title: anime.title });
+    if (anime.image) detailParams.set('image', anime.image);
+    const r = await safeFetch<{ anime: AnimeDetail }>(`/api/anime/${anime.id}?${detailParams.toString()}`);
     if (!r.ok) setDetailError(r.error!); else setSelectedAnime(r.data!.anime);
     setDetailLoading(false);
   }, []);
@@ -147,6 +149,7 @@ export default function HomePage() {
     const params = new URLSearchParams();
     params.set('title', selectedAnime.title);
     if (selectedAnime.anidbId) params.set('anidbId', selectedAnime.anidbId);
+    if (selectedAnime.providerAliases?.length) params.set('aliases', selectedAnime.providerAliases.join('|'));
     params.set('lang', audioLang);
     const r = await safeFetch<{ stream: StreamData }>(`/api/stream/${selectedAnime.id}/${ep}?${params.toString()}`);
     if (!r.ok) { setStreamError(r.error!); }
@@ -187,6 +190,7 @@ export default function HomePage() {
       const params = new URLSearchParams();
       params.set('title', selectedAnime.title);
       if (selectedAnime.anidbId) params.set('anidbId', selectedAnime.anidbId);
+      if (selectedAnime.providerAliases?.length) params.set('aliases', selectedAnime.providerAliases.join('|'));
       params.set('lang', lang);
       setStreamLoading(true);
       safeFetch<{ stream: StreamData }>(`/api/stream/${selectedAnime.id}/${ep}?${params.toString()}`).then(r => {

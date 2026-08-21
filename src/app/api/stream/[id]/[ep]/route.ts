@@ -22,8 +22,12 @@ export async function GET(
     const title = req.nextUrl.searchParams.get('title') || '';
     const anidbId = req.nextUrl.searchParams.get('anidbId') || undefined;
     const lang = req.nextUrl.searchParams.get('lang') || 'eng';
+    const aliases = (req.nextUrl.searchParams.get('aliases') || '')
+      .split('|')
+      .map((alias) => alias.trim())
+      .filter(Boolean);
 
-    const result = await findStreamForAnime(anilistId, episode, title, anidbId, lang);
+    const result = await findStreamForAnime(anilistId, episode, title, anidbId, lang, aliases);
     if (!result.ok) {
       return Response.json({ error: result.error }, { status: 502 });
     }

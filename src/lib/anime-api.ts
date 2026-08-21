@@ -52,6 +52,7 @@ export interface AnimeDetail extends AnimeSearchResult {
   // anidb-specific
   anidbId?: string;
   anidbSlug?: string;
+  providerAliases?: string[];
   providerEpisodes?: EpisodeInfo[];
 }
 
@@ -96,6 +97,32 @@ async function kitsuFetch(path: string, params?: Record<string, string | number 
   };
 }
 
+function getKitsuAliases(item: Record<string, unknown>): string[] {
+  const attrs = (item.attributes || {}) as Record<string, unknown>;
+  const titles = (attrs.titles || {}) as Record<string, string>;
+  const abbreviated = Array.isArray(attrs.abbreviatedTitles) ? attrs.abbreviatedTitles as string[] : [];
+  const slug = typeof attrs.slug === 'string' ? attrs.slug.replace(/-/g, ' ') : '';
+  return [...new Set([
+    titles.en,
+    titles.en_us,
+    titles.en_jp,
+    titles.ja_jp,
+    titles.en_kr,
+    titles.ko_kr,
+    attrs.canonicalTitle as string,
+    ...abbreviated,
+    slug,
+  ].filter((value): value is string => !!value?.trim()))];
+}
+
+function isJapaneseKitsu(item: Record<string, unknown>): boolean {
+  const attrs = (item.attributes || {}) as Record<string, unknown>;
+  const titles = (attrs.titles || {}) as Record<string, string>;
+  const hasJapaneseTitle = Boolean(titles.ja_jp || titles.en_jp);
+  const clearlyKoreanOrChinese = Boolean(titles.ko_kr || titles.en_kr || titles.zh_cn || titles.en_cn || titles.zh_tw);
+  return hasJapaneseTitle && !clearlyKoreanOrChinese;
+}
+
 function mapKitsuAnime(item: Record<string, unknown>): AnimeSearchResult {
   const attrs = (item.attributes || {}) as Record<string, unknown>;
   const titles = (attrs.titles || {}) as Record<string, string>;
@@ -123,7 +150,8 @@ function mapKitsuAnime(item: Record<string, unknown>): AnimeSearchResult {
 // ── anidb.app scraping fallbacks ──
 function mapAnidbToSearchResult(r: AnimeResult, image?: string): AnimeSearchResult {
   return {
-    id: Number(r.id),
+    // Negative IDs identify anidb-only fallback records and avoid Kitsu ID collisions.
+    id: -Number(r.id),
     title: r.title,
     titleJp: null,
     image: image || '',
@@ -167,12 +195,12 @@ async function anidbDetail(title: string): Promise<{ ok: boolean; anime?: AnimeD
     return {
       ok: true,
       anime: {
-        id: Number(match.id),
+        id: -Number(match.id),
         title: match.title,
         titleJp: null, image: '', banner: null, format: null,
         episodes: eps?.length || null, status: null, score: null, year: null,
         genres: [], description: null, studios: [], season: null, duration: null, source: null,
-        anidbId: match.id, anidbSlug: match.slug, providerEpisodes: eps,
+        anidbId: match.id, anidbSlug: match.slug, providerAliases: [title, match.title], providerEpisodes: eps,
       },
     };
   } catch (e) {
@@ -232,7 +260,10 @@ export async function browseAnime(sort: BrowseSort = 'trending', page = 1): Prom
     }
     const json = await kitsuFetch(path, params);
     const data = Array.isArray(json.data) ? json.data : [];
-    if (data.length > 0) return { ok: true, results: data.map(mapKitsuAnime), hasNextPage: !!json.links?.next };
+    const filtered = (sort === 'recent' || sort === 'trending')
+      ? data.filter(isJapaneseKitsu)
+      : data;
+    if (filtered.length > 0) return { ok: true, results: filtered.map(mapKitsuAnime), hasNextPage: !!json.links?.next };
   } catch { /* Kitsu down, fall through to anidb */ }
 
   return anidbBrowse(page);
@@ -250,28 +281,38 @@ export async function searchAnime(query: string, page = 1): Promise<{ ok: boolea
   return anidbSearch(query);
 }
 
-export async function getAnimeDetail(id: number): Promise<{ ok: boolean; anime?: AnimeDetail; error?: ApiError }> {
-  // Try Kitsu first
+export async function getAnimeDetail(
+  id: number,
+  fallbackTitle?: string,
+  fallbackImage?: string,
+): Promise<{ ok: boolean; anime?: AnimeDetail; error?: ApiError }> {
+  // Try Kitsu first unless this is an anidb-only negative fallback ID.
   let base: AnimeSearchResult | null = null;
   let kitsuAttrs: Record<string, unknown> = {};
-  try {
-    const json = await kitsuFetch(`/anime/${id}`);
-    const item = (!Array.isArray(json.data) ? json.data : null) as Record<string, unknown> | null;
-    if (item) {
-      base = mapKitsuAnime(item);
-      kitsuAttrs = (item.attributes || {}) as Record<string, unknown>;
-    }
-  } catch { /* Kitsu down */ }
+  let providerAliases: string[] = fallbackTitle ? [fallbackTitle] : [];
+  if (id > 0) {
+    try {
+      const json = await kitsuFetch(`/anime/${id}`);
+      const item = (!Array.isArray(json.data) ? json.data : null) as Record<string, unknown> | null;
+      if (item) {
+        base = mapKitsuAnime(item);
+        kitsuAttrs = (item.attributes || {}) as Record<string, unknown>;
+        providerAliases = [...new Set([...getKitsuAliases(item), ...providerAliases])];
+      }
+    } catch { /* Kitsu down */ }
+  }
 
-  // Get anidb provider data
-  const searchTitle = base?.titleJp || base?.title || String(id);
+  if (base && !providerAliases.includes(base.title)) providerAliases.unshift(base.title);
+  if (base?.titleJp && !providerAliases.includes(base.titleJp)) providerAliases.push(base.titleJp);
+  if (!providerAliases.length) providerAliases = [String(Math.abs(id))];
+
+  // Get anidb provider data using all known aliases
   let anidbId: string | undefined;
   let anidbSlug: string | undefined;
   let providerEpisodes: EpisodeInfo[] | undefined;
   try {
-    const anidbResult = await searchAnidb(searchTitle);
-    if (anidbResult.length > 0) {
-      const match = anidbResult.find((r) => base && r.title.toLowerCase() === base.title.toLowerCase()) || anidbResult[0];
+    const match = await findAnidbMatch(providerAliases);
+    if (match) {
       anidbId = match.id;
       anidbSlug = match.slug;
       const epsResult = await getEpisodes(match.id);
@@ -279,15 +320,16 @@ export async function getAnimeDetail(id: number): Promise<{ ok: boolean; anime?:
 
       // If Kitsu was down, build base from anidb
       if (!base) {
-        base = mapAnidbToSearchResult(match);
+        base = mapAnidbToSearchResult(match, fallbackImage);
+        if (fallbackTitle) base.title = fallbackTitle;
         base.episodes = providerEpisodes?.length || null;
       }
     }
   } catch { /* anidb also failed */ }
 
   if (!base) {
-    // Both Kitsu and anidb failed — try anidb detail as last resort
-    return anidbDetail(String(id));
+    // Both Kitsu and the first provider match failed — retry by the visible title.
+    return anidbDetail(fallbackTitle || String(Math.abs(id)));
   }
 
   return {
@@ -298,31 +340,92 @@ export async function getAnimeDetail(id: number): Promise<{ ok: boolean; anime?:
       season: null,
       duration: (kitsuAttrs.episodeLength as number | null) || null,
       source: null,
-      anidbId, anidbSlug, providerEpisodes,
+      anidbId, anidbSlug, providerAliases, providerEpisodes,
     },
   };
 }
 
 // ── anidb.app search (HTML scraping) ──
+function normalizeTitle(value: string): string {
+  return value
+    .toLowerCase()
+    .normalize('NFKD')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+
+function wait(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function searchAnidb(query: string): Promise<AnimeResult[]> {
-  const html = await anidbFetch(`${BASE}/browse?q=${encodeURIComponent(query)}`);
-  return parseAnidbHtml(html);
+  const cleanQuery = query.trim();
+  if (!cleanQuery) return [];
+
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const html = await anidbFetch(`${BASE}/browse?q=${encodeURIComponent(cleanQuery)}`);
+      const results = parseAnidbHtml(html);
+      if (results.length > 0) return results;
+    } catch (error) {
+      lastError = error;
+    }
+    if (attempt < 2) await wait(250 * (attempt + 1));
+  }
+
+  if (lastError) throw lastError;
+  return [];
+}
+
+async function findAnidbMatch(aliases: string[]): Promise<AnimeResult | null> {
+  const uniqueAliases = [...new Set(aliases.map((alias) => alias.trim()).filter(Boolean))];
+  let firstResult: AnimeResult | null = null;
+
+  for (const alias of uniqueAliases) {
+    const results = await searchAnidb(alias);
+    if (!results.length) continue;
+    firstResult ||= results[0];
+
+    const normalizedAlias = normalizeTitle(alias);
+    const exact = results.find((result) => {
+      const title = normalizeTitle(result.title);
+      const slug = normalizeTitle(result.slug.replace(/-\d+$/, '').replace(/-/g, ' '));
+      return title === normalizedAlias || slug === normalizedAlias;
+    });
+    if (exact) return exact;
+  }
+
+  return firstResult;
 }
 
 // ── anidb.app episodes ──
 export async function getEpisodes(anidbId: string): Promise<{ ok: boolean; episodes?: EpisodeInfo[]; error?: ApiError }> {
-  try {
-    const raw = await anidbFetch(`${BASE}/api/frontend/anime/${anidbId}/episodes`);
-    const data = JSON.parse(raw);
-    const episodes: EpisodeInfo[] = (data.episodes || []).map((e: { id: number; number: number; filler: boolean }) => ({
-      id: e.id,
-      number: e.number,
-      filler: e.filler || false,
-    }));
-    return { ok: true, episodes };
-  } catch (e) {
-    return { ok: false, error: { type: 'ANIDB_ERROR', message: 'Failed to load episodes from anidb', technical: `anidb.app episodes API error: ${e instanceof Error ? e.message : String(e)}` } };
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const raw = await anidbFetch(`${BASE}/api/frontend/anime/${anidbId}/episodes`);
+      const data = JSON.parse(raw);
+      const episodes: EpisodeInfo[] = (data.episodes || []).map((e: { id: number; number: number; filler: boolean }) => ({
+        id: e.id,
+        number: e.number,
+        filler: e.filler || false,
+      }));
+      if (episodes.length > 0) return { ok: true, episodes };
+    } catch (error) {
+      lastError = error;
+    }
+    if (attempt < 2) await wait(250 * (attempt + 1));
   }
+
+  return {
+    ok: false,
+    error: {
+      type: 'ANIDB_ERROR',
+      message: 'Failed to load episodes from anidb',
+      technical: `anidb.app episodes API failed after retries: ${lastError instanceof Error ? lastError.message : String(lastError || 'empty response')}`,
+    },
+  };
 }
 
 // ── anidb.app streaming ──
@@ -369,30 +472,43 @@ export async function getStream(anidbEpId: number, lang = 'jpn'): Promise<{ ok: 
 
 // ── Combined: find stream for AniList anime + episode number ──
 export async function findStreamForAnime(
-  anilistId: number,
+  metadataId: number,
   episodeNum: number,
   title: string,
   anidbIdHint?: string,
-  lang?: string
+  lang?: string,
+  aliases: string[] = []
 ): Promise<{ ok: boolean; stream?: StreamResult; error?: ApiError }> {
   try {
-    // Step 1: Find anidb ID
+    // Step 1: Find anidb ID. Use every known alias and retry transient empty results.
     let anidbId = anidbIdHint;
     if (!anidbId) {
-      const searchResults = await searchAnidb(title);
-      if (searchResults.length > 0) {
-        anidbId = searchResults[0].id;
-      }
+      const match = await findAnidbMatch([title, ...aliases]);
+      if (match) anidbId = match.id;
     }
 
     if (!anidbId) {
-      return { ok: false, error: { type: 'NOT_FOUND', message: `Could not find "${title}" on streaming provider`, technical: `Search for "${title}" on anidb.app returned no results. AniList ID: ${anilistId}` } };
+      return {
+        ok: false,
+        error: {
+          type: 'NOT_FOUND',
+          message: `Could not match "${title}" to the streaming catalog`,
+          technical: `anidb.app returned no results after retries. Metadata ID: ${metadataId}. Tried aliases: ${[title, ...aliases].join(', ')}`,
+        },
+      };
     }
 
-    // Step 2: Get episodes to find the right episode ID
-    const epsResult = await getEpisodes(anidbId);
+    // Step 2: Get episodes. If a cached provider ID became stale, rematch aliases once.
+    let epsResult = await getEpisodes(anidbId);
     if (!epsResult.ok || !epsResult.episodes) {
-      return { ok: false, error: epsResult.error || { type: 'ANIDB_ERROR', message: 'Failed to load episodes', technical: 'Episodes request failed' } };
+      const replacement = await findAnidbMatch([title, ...aliases]);
+      if (replacement && replacement.id !== anidbId) {
+        anidbId = replacement.id;
+        epsResult = await getEpisodes(anidbId);
+      }
+    }
+    if (!epsResult.ok || !epsResult.episodes) {
+      return { ok: false, error: epsResult.error || { type: 'ANIDB_ERROR', message: 'Failed to load episodes', technical: 'Episodes request failed after rematching aliases' } };
     }
 
     const targetEp = epsResult.episodes.find(e => e.number === episodeNum);

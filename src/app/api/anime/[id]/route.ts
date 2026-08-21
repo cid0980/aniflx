@@ -4,7 +4,7 @@ import { NextRequest } from 'next/server';
 export const dynamic = 'force-dynamic';
 
 export async function GET(
-  _req: NextRequest,
+  req: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
@@ -17,7 +17,9 @@ export async function GET(
       );
     }
 
-    const result = await getAnimeDetail(numId);
+    const fallbackTitle = req.nextUrl.searchParams.get('title') || undefined;
+    const fallbackImage = req.nextUrl.searchParams.get('image') || undefined;
+    const result = await getAnimeDetail(numId, fallbackTitle, fallbackImage);
     if (!result.ok) {
       return Response.json({ error: result.error }, { status: 502 });
     }
